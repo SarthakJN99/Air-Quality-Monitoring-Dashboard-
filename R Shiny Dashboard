@@ -1,0 +1,818 @@
+library(shiny)
+library(leaflet)
+library(shinyWidgets)
+library(lubridate)
+library(dplyr)
+library(shinythemes)
+library(shinydashboard)
+library(httr2)
+library(rlist)
+library(purrr)
+library(readr)
+library(DBI)
+library(RSQLite)
+library(shinyTime)
+library(httr)
+library(tidyr)
+library(magrittr)
+library(highcharter)
+library(ggplot2)
+
+# Function to establish a connection to the SQLite database
+connect_to_sqlite <- function(db_file_path) {
+  con <- dbConnect(RSQLite::SQLite(), dbname = db_file_path)
+  return(con)
+}
+
+# Function to fetch historical PurpleAir data for the last 14 days
+fetch_historical_purpleair_data <- function(con) {
+  end_date <- Sys.Date() + 1
+  start_date <- end_date - 14
+  query <- sprintf(
+    "SELECT * FROM PurpleAir_history WHERE date BETWEEN '%s' AND '%s'",
+    format(start_date, "%m/%d/%Y"), format(end_date, "%m/%d/%Y")
+  )
+  data <- dbGetQuery(con, query)
+  return(data)
+}
+
+# Function to fetch historical Clarity data for the last 14 days
+fetch_historical_clarity_data <- function(con) {
+  end_date <- Sys.Date() + 1
+  start_date <- end_date - 14
+  query <- sprintf(
+    "SELECT * FROM Clarity_History WHERE date BETWEEN '%s' AND '%s'",
+    format(start_date, "%m/%d/%Y"), format(end_date, "%m/%d/%Y")
+  )
+  data <- dbGetQuery(con, query)
+  return(data)
+}
+
+# Function to fetch historical AirNow data for the last 14 days
+fetch_historical_airnow_data <- function(con) {
+  end_date <- Sys.Date() + 1
+  start_date <- end_date - 14
+  query <- sprintf(
+    "SELECT * FROM AirNowHistory WHERE date BETWEEN '%s' AND '%s'",
+    format(start_date, "%m/%d/%Y"), format(end_date, "%m/%d/%Y")
+  )
+  data <- dbGetQuery(con, query)
+  return(data)
+}
+
+# Function to fetch current PurpleAir data
+fetch_current_purpleair_data <- function(group_id, api_key) {
+  base_url <- paste0("https://api.purpleair.com/v1/groups/", group_id, "/members")
+  fields <- "sensor_index,latitude,longitude,humidity,temperature,pressure,pm2.5_60minute,pm1.0_atm,pm10.0_atm"
+  
+  req <- request(base_url) %>%
+    req_headers(`X-API-Key` = api_key) %>%
+    req_url_query(fields = fields)
+  
+  tryCatch({
+    resp <- req_perform(req)
+    
+    data <- resp_body_json(resp)
+    
+    if (!is.null(data$error)) {
+      stop("API Error: ", data$error)
+    }
+    
+    fields <- unlist(data$fields)
+    data <- data$data
+    data_df <- do.call(rbind, lapply(data, function(x) setNames(as.data.frame(t(x)), fields)))
+    
+    sensor_index_map <- c("195573" = "203605", "195613" = "203608", "195811" = "203612", "195843" = "203610",
+                          "195563" = "203611", "195815" = "203609", "218251" = "211120", "218265" = "211144", 
+                          "218263" = "211145", "218233" = "211146", "218227" = "211147", 
+                          "218277" = "211148", "218279" = "211149", "218259" = "211150", "218391" = "211151", 
+                          "218229" = "211152", "219021" = "211153", "218959" = "211154", "218065" = "211155")
+    
+    data_df$sensor_index <- as.character(data_df$sensor_index)
+    data_df$sensor_index <- sapply(data_df$sensor_index, function(x) if (x %in% names(sensor_index_map)) sensor_index_map[[x]] else x)
+    
+    colnames(data_df) <- c("member_id", "latitude", "longitude", "humidity", "temperature", "pressure", "pm2_5_atm", "pm1_0_atm", "pm10_0_atm")
+    
+    data_df$date <- format(with_tz(Sys.time(), tzone = "US/Eastern"), "%m/%d/%Y")
+    
+    return(data_df)
+  }, error = function(e) {
+    message("Error fetching data from PurpleAir API: ", e$message)
+    return(NULL)
+  })
+}
+
+# Clarity API key
+clarity_api_key <- "cxbOjMTzGzaMXvx42dDpzTyEOkXBgXRjkL1Js1Be"
+
+# Function to retrieve API response
+retrieve_clarity_api_response <- function(template, params = NULL, body = NULL, dryRun = F, showRequest = T) {
+  base_req <- request("https://clarity-data-api.clarity.io/") %>%
+    req_headers(`x-api-key` = clarity_api_key,
+                .redact = "x-api-key")
+  req <- base_req %>%
+    req_template(template)
+  
+  if (!is.null(params)) req <- req_url_query(req, !!!params, .multi = "comma")
+  if (!is.null(body)) req <- req_body_json(req, body)
+  
+  if (dryRun | showRequest) req_dry_run(req)
+  
+  if (!dryRun) {
+    resp <- req_perform(req)
+    return(resp)
+  }
+}
+
+# Function to get devices nodes
+get_devices_nodes <- function(org, flatten = T) {
+  params <- list(org = org)
+  resp <- retrieve_clarity_api_response(template = "GET /v2/devices/nodes", params = params)
+  raw <- resp_body_json(resp)
+  
+  if (flatten) {
+    data <- lapply(raw, list_flatten_recursive) %>%
+      dplyr::bind_rows() %>%
+      dplyr::rename(location.coordinates.long = location.coordinates.1,
+                    location.coordinates.lat = location.coordinates.2)
+  } else data <- raw
+  return(data)
+}
+
+# Function to post recent datasource measurements query
+post_recent_datasource_measurements_query <- function(
+    org, allDatasources = NULL, datasourceIds = NULL, outputFrequency = "hour", 
+    format = "json-long", startTime = NULL, metricSelect = NULL) {
+  body <- list(org = org, allDatasources = allDatasources, datasourceIds = datasourceIds,
+               outputFrequency = outputFrequency, format = format, startTime = startTime,
+               metricSelect = metricSelect) %>%
+    rlist::list.clean()
+  
+  resp <- retrieve_clarity_api_response(template = "POST v2/recent-datasource-measurements-query", body = body)
+  
+  if (resp_content_type(resp) == "text/csv") {
+    data <- resp_body_raw(resp) %>% readr::read_csv(show_col_types = FALSE)
+  } else if (resp_content_type(resp) == "application/json") {
+    data <- resp_body_json(resp)
+  }
+  
+  return(data)
+}
+
+# Example of the functionality of retrieve_clarity_api_response
+org <- "dcdoee3MXW"
+# Get the nodes data
+nodes <- get_devices_nodes(org = org, flatten = F)
+
+# Get the recent datasource measurements
+test_csv <- post_recent_datasource_measurements_query(
+  org = org,
+  allDatasources = T,
+  format = "csv-wide",
+  metricSelect = "only no2Conc1HourMean + pm2_5ConcMass1HourMean + pm10ConcMass1HourMean + temperatureInternal1HourMean + relHumidInternal1HourMean"
+)
+
+# Debugging: Print the structure of the dataframe
+print("Structure of test_csv dataframe:")
+print(str(test_csv))
+
+# Filter the dataframe to include only rows where sourceType == "CLARITY_NODE"                             
+filtered_data <- test_csv %>%
+  filter(sourceType == "CLARITY_NODE")
+
+# Debugging: Print the structure of the filtered dataframe
+print("Structure of filtered_data dataframe:")
+print(str(filtered_data))
+
+# Convert endOfPeriod to EST and create new date and time columns
+filtered_data <- filtered_data %>%
+  mutate(endOfPeriod = with_tz(endOfPeriod, tzone = "America/New_York"),
+         date = format(as.Date(endOfPeriod), "%m/%d/%Y"),
+         time = format(endOfPeriod, "%H:%M"))
+
+# Select only the specified columns and rename them
+selected_data <- filtered_data %>%
+  select(sourceId, endOfPeriod, date, time, locationLatitude, locationLongitude, 
+         no2Conc1HourMean.value, pm10ConcMass1HourMean.value, pm2_5ConcMass1HourMean.value, 
+         relHumidInternal1HourMean.value) %>%
+  rename(latitude = locationLatitude,
+         longitude = locationLongitude,
+         NO2 = no2Conc1HourMean.value,
+         PM10 = pm10ConcMass1HourMean.value,
+         PM2_5 = pm2_5ConcMass1HourMean.value,
+         humidity_internal = relHumidInternal1HourMean.value)
+
+# Function to fetch current AirNow data
+fetch_current_airnow_data <- function() {
+  DATE_URL <- "https://s3-us-west-1.amazonaws.com/files.airnowtech.org/airnow/"
+  DC_SITES <- c("RIVER_Terrace", "McMillan Reservoir", "DCNearRoad", "King Greenleaf Rec C", "TakomaRec", "Bald Eagle")
+  PARAMETERS <- c("PM2.5", "NO2", "OZONE", "CO", "RHUM", "RWD", "RWS", "BARPR", "PRECIP", "TEMP")
+  MAX_RETRIES <- 5
+  RETRY_DELAY <- 5  # in seconds
+  
+  # Coordinates for each site
+  SITE_COORDINATES <- list(
+    "RIVER_Terrace" = c(38.895572, -76.958072),
+    "McMillan Reservoir" = c(38.921847, -77.013178),
+    "DCNearRoad" = c(38.894770, -76.953426),
+    "TakomaRec" = c(38.970092, -77.016715),
+    "King Greenleaf Rec C" = c(38.875161, -77.012816),
+    "Bald Eagle" = c(38.8187243, -77.0102537)
+  )
+  
+  # Timezone conversion
+  utc <- "UTC"
+  eastern <- "US/Eastern"
+  
+  # Get the previous hour's date and hour
+  current_date <- now(tzone = utc)
+  previous_hour_date <- current_date - hours(1)
+  year <- year(previous_hour_date)
+  full_date <- format(previous_hour_date, "%Y%m%d")
+  hour <- format(previous_hour_date, "%H")
+  filename <- paste0("HourlyData_", full_date, hour, ".dat")
+  remote <- paste0(DATE_URL, year, "/", full_date, "/", filename)
+  local_filename <- paste0("./", filename)
+  
+  # Function to fetch data with retries
+  fetch_data_with_retries <- function(remote, local_filename, max_retries, retry_delay) {
+    for (attempt in 1:max_retries) {
+      tryCatch({
+        response <- GET(remote, write_disk(local_filename, overwrite = TRUE))
+        if (response$status_code == 200) {
+          print(paste("Downloaded", filename, "successfully on attempt", attempt))
+          return(TRUE)
+        } else {
+          stop("Failed to download file")
+        }
+      }, error = function(e) {
+        print(paste("Attempt", attempt, "failed:", e))
+        if (attempt < max_retries) {
+          print(paste("Retrying in", retry_delay, "seconds..."))
+          Sys.sleep(retry_delay)
+        } else {
+          print("Maximum retries reached. Could not download the data.")
+          return(FALSE)
+        }
+      })
+    }
+  }
+  
+  # Fetch data for the previous hour and save locally
+  if (fetch_data_with_retries(remote, local_filename, MAX_RETRIES, RETRY_DELAY)) {
+    # Read and process the downloaded .dat file
+    datefile <- tryCatch({
+      read_lines_raw(local_filename)
+    }, error = function(e) {
+      print(paste("Could not read the downloaded file", local_filename, ":", e))
+      NULL
+    })
+    
+    if (!is.null(datefile)) {
+      # Convert raw lines to character, ignoring errors
+      datefile <- iconv(datefile, from = "latin1", to = "UTF-8", sub = "")
+      
+      # Filter lines early
+      dc_lines <- datefile[grepl("District of Columbia", datefile)]
+      
+      data_list <- list()
+      for (line in dc_lines) {
+        # Try-catch block to handle encoding issues and missing sites
+        tryCatch({
+          line_parts <- strsplit(line, "\\|")[[1]]
+          observation_date <- line_parts[1]
+          observation_time <- line_parts[2]
+          site <- line_parts[4]
+          parameter <- line_parts[6]
+          value <- as.numeric(line_parts[8])
+          data_list[[length(data_list) + 1]] <- list(
+            date = observation_date,
+            time = observation_time,
+            site = site,
+            parameter = parameter,
+            value = value
+          )
+        }, warning = function(w) {
+          message("Skipping line due to encoding issue: ", line)
+        }, error = function(e) {
+          message("Skipping line due to error: ", line)
+        })
+      }
+      
+      # Convert list to data frame and check its structure
+      data_df <- bind_rows(data_list)
+      if (nrow(data_df) == 0) {
+        message("No data found for the District of Columbia.")
+        return(NULL)
+      }
+      
+      data_df <- data_df %>%
+        filter(site %in% DC_SITES, parameter %in% PARAMETERS) %>%
+        pivot_wider(names_from = parameter, values_from = value) %>%
+        mutate(
+          datetime = as.POSIXct(paste(date, time), format = "%m/%d/%y %H:%M", tz = utc),
+          datetime = with_tz(datetime, eastern)
+        ) %>%
+        mutate(
+          date = format(datetime, "%m/%d/%Y"),
+          hour = format(datetime, "%H:%M")
+        ) %>%
+        select(-datetime)
+      
+      # Add latitude and longitude coordinates for each site individually
+      AirNow_data <- data_df %>%
+        rowwise() %>%
+        mutate(
+          latitude = SITE_COORDINATES[[site]][1],
+          longitude = SITE_COORDINATES[[site]][2]
+        ) %>%
+        ungroup()
+      
+      AirNow_data <- AirNow_data %>%
+        pivot_longer(cols = all_of(PARAMETERS), names_to = "parameter", values_to = "value") %>%
+        pivot_wider(names_from = parameter, values_from = value) %>%
+        select(site, date, hour, ozone = OZONE, pm = `PM2.5`, NO2, RHUM, RWS, BARPR, RWD, TEMP, CO, PRECIP, latitude, longitude)
+      
+      return(AirNow_data)
+    } else {
+      print("No data to process.")
+      return(NULL)
+    }
+  } else {
+    print("Failed to fetch data after maximum retries.")
+    return(NULL)
+  }
+}
+
+# Example usage for fetching historical PurpleAir data
+purpleair_db_path <- "Z:\\Air Quality Planning Branch\\Monitoring Data Analysis\\Air Sensors Databases\\PurpleAirDB.sqlite"
+purpleair_con <- connect_to_sqlite(purpleair_db_path)
+historical_purpleair_data <- fetch_historical_purpleair_data(purpleair_con)
+print("Fetched PurpleAir Data:")
+print(historical_purpleair_data)
+print(colnames(historical_purpleair_data))
+dbDisconnect(purpleair_con)
+
+# Example usage for fetching historical Clarity data
+clarity_db_path <- "Z:\\Air Quality Planning Branch\\Monitoring Data Analysis\\Air Sensors Databases\\ClarityDB.sqlite"
+clarity_con <- connect_to_sqlite(clarity_db_path)
+historical_clarity_data <- fetch_historical_clarity_data(clarity_con)
+print("Fetched Clarity Data:")
+print(historical_clarity_data)
+print(colnames(historical_clarity_data))
+dbDisconnect(clarity_con)
+
+# Example usage for fetching historical AirNow data
+airnow_db_path <- "Z:\\Air Quality Planning Branch\\Monitoring Data Analysis\\Air Sensors Databases\\AirNowDB.sqlite"
+airnow_con <- connect_to_sqlite(airnow_db_path)
+historical_airnow_data <- fetch_historical_airnow_data(airnow_con)
+print("Fetched AirNow Data:")
+print(historical_airnow_data)
+print(colnames(historical_airnow_data))
+dbDisconnect(airnow_con)
+
+# Function to filter data based on selected pollutants and met data
+filter_data_by_pollutants_and_metdata <- function(data, pollutants, met_data) {
+  if (!is.null(data) && nrow(data) > 0) {
+    filtered_data <- data
+    
+    # Create a logical vector to store if each row meets all the conditions
+    conditions_met <- rep(TRUE, nrow(data))
+    
+    if ("Ozone" %in% pollutants) {
+      print("Filtering for Ozone")
+      conditions_met <- conditions_met & ((if ("ozone" %in% colnames(data)) !is.na(data$ozone) else FALSE) |
+                                            (if ("Ozone" %in% colnames(data)) !is.na(data$Ozone) else FALSE))
+    }
+    if ("PM1" %in% pollutants) {
+      print("Filtering for PM1")
+      conditions_met <- conditions_met & (if ("pm1_0_atm" %in% colnames(data)) !is.na(data$pm1_0_atm) else FALSE)
+    }
+    if ("PM2.5" %in% pollutants) {
+      print("Filtering for PM2.5")
+      conditions_met <- conditions_met & ((if ("pm2_5_atm" %in% colnames(data)) !is.na(data$pm2_5_atm) else FALSE) |
+                                            (if ("PM2_5" %in% colnames(data)) !is.na(data$PM2_5) else FALSE) |
+                                            (if ("pm" %in% colnames(data)) !is.na(data$pm) else FALSE))
+    }
+    if ("PM10" %in% pollutants) {
+      print("Filtering for PM10")
+      conditions_met <- conditions_met & ((if ("pm10_0_atm" %in% colnames(data)) !is.na(data$pm10_0_atm) else FALSE) |
+                                            (if ("PM10" %in% colnames(data)) !is.na(data$PM10) else FALSE))
+    }
+    if ("NO2" %in% pollutants) {
+      print("Filtering for NO2")
+      conditions_met <- conditions_met & (if ("NO2" %in% colnames(data)) !is.na(data$NO2) else FALSE)
+    }
+    if ("CO" %in% pollutants) {
+      print("Filtering for CO")
+      conditions_met <- conditions_met & (if ("CO" %in% colnames(data)) !is.na(data$CO) else FALSE)
+    }
+    if ("Precipitation" %in% pollutants) {
+      print("Filtering for Precipitation")
+      conditions_met <- conditions_met & (if ("PRECIP" %in% colnames(data)) !is.na(data$PRECIP) else FALSE)
+    }
+    if ("Wind Speed" %in% met_data) {
+      print("Filtering for Wind Speed")
+      conditions_met <- conditions_met & (if ("RWS" %in% colnames(data)) !is.na(data$RWS) else FALSE)
+    }
+    if ("Wind Direction" %in% met_data) {
+      print("Filtering for Wind Direction")
+      conditions_met <- conditions_met & (if ("RWD" %in% colnames(data)) !is.na(data$RWD) else FALSE)
+    }
+    if ("Temperature" %in% met_data) {
+      print("Filtering for Temperature")
+      conditions_met <- conditions_met & ((if ("TEMP" %in% colnames(data)) !is.na(data$TEMP) else FALSE) |
+                                            (if ("temperature" %in% colnames(data)) !is.na(data$temperature) else FALSE))
+    }
+    if ("Humidity" %in% met_data) {
+      print("Filtering for Humidity")
+      conditions_met <- conditions_met & ((if ("RHUM" %in% colnames(data)) !is.na(data$RHUM) else FALSE) |
+                                            (if ("humidity_internal" %in% colnames(data)) !is.na(data$humidity_internal) else FALSE) |
+                                            (if ("humidity" %in% colnames(data)) !is.na(data$humidity) else FALSE))
+    }
+    if ("Pressure" %in% met_data) {
+      print("Filtering for Pressure")
+      conditions_met <- conditions_met & ((if ("BARPR" %in% colnames(data)) !is.na(data$BARPR) else FALSE) |
+                                            (if ("pressure" %in% colnames(data)) !is.na(data$pressure) else FALSE))
+    }
+    
+    # Filter the data based on the conditions_met vector
+    filtered_data <- filtered_data[conditions_met, ]
+    
+    # Print out the sites that remain after filtering for debugging
+    print("Filtered data sites:")
+    print(unique(filtered_data$site))
+    
+    # Ensure that the filtered data has rows matching the criteria
+    if (nrow(filtered_data) == 0) {
+      filtered_data <- NULL
+    }
+    
+    return(filtered_data)
+  }
+  
+  return(NULL)
+}
+
+# Shiny UI
+header <- dashboardHeader(title = "Air Quality Monitoring Dashboard")
+sidebar <- dashboardSidebar(
+  sidebarMenu(
+    menuItem("Filters", tabName = "filters", icon = icon("filter"), startExpanded = TRUE,
+             dateInput("dateFilter", "Date Filter", value = Sys.Date(), min = Sys.Date() - 14, max = Sys.Date(), format = "mm/dd/yyyy"),
+             pickerInput("dataSources", "Data Sources", choices = c("Clarity", "Purple Air", "Air Now"), 
+                         options = list(`actions-box` = TRUE), multiple = TRUE),
+             pickerInput("pollutants", "Pollutants", choices = c("PM1", "PM2.5", "PM10", "NO2", "Ozone", "Black Carbon", "SO2", "CO", "Precipitation"), 
+                         multiple = TRUE),
+             pickerInput("metData", "Met Data", choices = c("Wind Speed", "Wind Direction", "Temperature", "Humidity", "Pressure"), 
+                         multiple = TRUE)
+    )
+  )
+)
+body <- dashboardBody(
+  fluidRow(
+    column(7,
+           leafletOutput("map", height = "600px")
+    ),
+    column(5,
+           plotOutput("time_series_chart", height = "300px"),
+           plotOutput("wind_chart", height = "300px")
+    )
+  ) 
+)
+ui <- dashboardPage(header, sidebar, body, skin = "green")
+
+# Shiny Server
+server <- function(input, output, session) {
+  # Define the group ID and API key here
+  group_id <- "2239"
+  api_key <- "8042CC01-DCCD-11EE-B9F7-42010A80000D"  # Note: Ensure this is securely stored in production
+  
+  # Reactive expression to fetch current and historical data
+  current_historical_data_reactive <- reactive({
+    purpleair_data <- fetch_current_purpleair_data(group_id, api_key)
+    clarity_data <- selected_data
+    
+    # Fetch historical data
+    purpleair_con <- connect_to_sqlite(purpleair_db_path)
+    historical_purpleair_data <- fetch_historical_purpleair_data(purpleair_con)
+    dbDisconnect(purpleair_con)
+    
+    clarity_con <- connect_to_sqlite(clarity_db_path)
+    historical_clarity_data <- fetch_historical_clarity_data(clarity_con)
+    dbDisconnect(clarity_con)
+    
+    airnow_con <- connect_to_sqlite(airnow_db_path)
+    historical_airnow_data <- fetch_historical_airnow_data(airnow_con)
+    dbDisconnect(airnow_con)
+    
+    # Fetch current AirNow data
+    airnow_current_data <- tryCatch(fetch_current_airnow_data(), error = function(e) {
+      message("Error fetching current AirNow data: ", e$message)
+      return(NULL)
+    })
+    
+    # Print debug information
+    print("Current PurpleAir Data:")
+    print(purpleair_data)
+    print("Current Clarity Data:")
+    print(clarity_data)
+    print("Current AirNow Data:")
+    print(airnow_current_data)
+    
+    list(purpleair_current = purpleair_data, clarity_current = clarity_data, 
+         purpleair_historical = historical_purpleair_data, clarity_historical = historical_clarity_data,
+         airnow_historical = historical_airnow_data, airnow_current = airnow_current_data)
+  })
+  
+  # Render leaflet map
+  output$map <- renderLeaflet({
+    data <- current_historical_data_reactive()
+    
+    # Ensure latitude and longitude are numeric and not null for each dataset
+    data$purpleair_current <- if (!is.null(data$purpleair_current)) {
+      data$purpleair_current %>%
+        mutate(latitude = as.numeric(latitude),
+               longitude = as.numeric(longitude)) %>%
+        filter(!is.na(latitude) & !is.na(longitude))
+    } else NULL
+    
+    data$clarity_current <- if (!is.null(data$clarity_current)) {
+      data$clarity_current %>%
+        mutate(latitude = as.numeric(latitude),
+               longitude = as.numeric(longitude)) %>%
+        filter(!is.na(latitude) & !is.na(longitude))
+    } else NULL
+    
+    data$purpleair_historical <- if (!is.null(data$purpleair_historical)) {
+      data$purpleair_historical %>%
+        mutate(latitude = as.numeric(latitude),
+               longitude = as.numeric(longitude)) %>%
+        filter(!is.na(latitude) & !is.na(longitude))
+    } else NULL
+    
+    data$clarity_historical <- if (!is.null(data$clarity_historical)) {
+      data$clarity_historical %>%
+        mutate(latitude = as.numeric(latitude),
+               longitude = as.numeric(longitude)) %>%
+        filter(!is.na(latitude) & !is.na(longitude))
+    } else NULL
+    
+    data$airnow_historical <- if (!is.null(data$airnow_historical)) {
+      data$airnow_historical %>%
+        mutate(latitude = as.numeric(latitude),
+               longitude = as.numeric(longitude)) %>%
+        filter(!is.na(latitude) & !is.na(longitude))
+    } else NULL
+    
+    data$airnow_current <- if (!is.null(data$airnow_current)) {
+      data$airnow_current %>%
+        mutate(latitude = as.numeric(latitude),
+               longitude = as.numeric(longitude)) %>%
+        filter(!is.na(latitude) & !is.na(longitude))
+    } else NULL
+    
+    print("Filtered Data for Map Rendering:")
+    print(data)
+    
+    leaflet() %>%
+      addProviderTiles(providers$OpenStreetMap) %>%
+      {
+        if ("Purple Air" %in% input$dataSources && !is.null(data$purpleair_current)) {
+          debug_data <- filter_data_by_pollutants_and_metdata(data$purpleair_current, input$pollutants, input$metData)
+          print("Filtered PurpleAir Current Data for Map:")
+          print(debug_data)
+          if (!is.null(debug_data)) {
+            addMarkers(., data = debug_data, 
+                       ~longitude, ~latitude,
+                       popup = ~paste("Location:", member_id))
+          } else .
+        } else .
+      } %>%
+      {
+        if ("Clarity" %in% input$dataSources && !is.null(data$clarity_current)) {
+          debug_data <- filter_data_by_pollutants_and_metdata(data$clarity_current, input$pollutants, input$metData)
+          print("Filtered Clarity Current Data for Map:")
+          print(debug_data)
+          if (!is.null(debug_data)) {
+            addMarkers(., data = debug_data, 
+                       ~longitude, ~latitude,
+                       popup = ~paste("Location:", sourceId))
+          } else .
+        } else .
+      } %>%
+      {
+        if ("Purple Air" %in% input$dataSources && !is.null(data$purpleair_historical)) {
+          debug_data <- filter_data_by_pollutants_and_metdata(data$purpleair_historical, input$pollutants, input$metData)
+          print("Filtered PurpleAir Historical Data for Map:")
+          print(debug_data)
+          if (!is.null(debug_data)) {
+            addMarkers(., data = debug_data, 
+                       ~longitude, ~latitude,
+                       popup = ~paste("Location:", member_id))
+          } else .
+        } else .
+      } %>%
+      {
+        if ("Clarity" %in% input$dataSources && !is.null(data$clarity_historical)) {
+          debug_data <- filter_data_by_pollutants_and_metdata(data$clarity_historical, input$pollutants, input$metData)
+          print("Filtered Clarity Historical Data for Map:")
+          print(debug_data)
+          if (!is.null(debug_data)) {
+            addMarkers(., data = debug_data, 
+                       ~longitude, ~latitude,
+                       popup = ~paste("Location:", nodeId))
+          } else .
+        } else .
+      } %>%
+      {
+        if ("Air Now" %in% input$dataSources && !is.null(data$airnow_historical)) {
+          debug_data <- filter_data_by_pollutants_and_metdata(data$airnow_historical, input$pollutants, input$metData)
+          print("Filtered AirNow Historical Data for Map:")
+          print(debug_data)
+          if (!is.null(debug_data)) {
+            addMarkers(., data = debug_data, 
+                       ~longitude, ~latitude,
+                       popup = ~paste("Location:", site))
+          } else .
+        } else .
+      } %>%
+      {
+        if ("Air Now" %in% input$dataSources && !is.null(data$airnow_current)) {
+          debug_data <- filter_data_by_pollutants_and_metdata(data$airnow_current, input$pollutants, input$metData)
+          print("Filtered AirNow Current Data for Map:")
+          print(debug_data)
+          if (!is.null(debug_data)) {
+            addMarkers(., data = debug_data, 
+                       ~longitude, ~latitude,
+                       popup = ~paste("Location:", site))
+          } else .
+        } else .
+      }
+  })
+  
+  # Reactive expression for clicked location data
+  clicked_location_data <- reactiveVal(NULL)
+  
+  # Observe map clicks to update the chart
+  observeEvent(input$map_marker_click, {
+    click <- input$map_marker_click
+    data <- current_historical_data_reactive()
+    
+    print(paste("Map clicked at latitude:", click$lat, "longitude:", click$lng))  # Debugging step
+    
+    if (!is.null(click)) {
+      # Adjust buffer values if necessary
+      latitude_buffer <- 0.01  # Adjusted buffer for better matching
+      longitude_buffer <- 0.01  # Adjusted buffer for better matching
+      
+      clicked_data <- bind_rows(
+        data$clarity_current,
+        data$purpleair_current,
+        data$airnow_current
+      ) %>%
+        filter(abs(latitude - click$lat) < latitude_buffer & abs(longitude - click$lng) < longitude_buffer)
+      
+      print("Filtered data for clicked location:")
+      print(clicked_data)  # Debugging step
+      
+      if (nrow(clicked_data) > 0) {
+        clicked_location_data(clicked_data)
+      } else {
+        print("No matching data found for clicked location.")  # Debugging step
+        clicked_location_data(NULL)
+      }
+    }
+  })
+  
+  # Render the ggplot2 wind speed plot
+  output$wind_chart <- renderPlot({
+    clicked_data <- clicked_location_data()
+    
+    if (!is.null(clicked_data) && "Wind Speed" %in% input$metData) {
+      if ("RWS" %in% colnames(clicked_data)) {
+        df <- clicked_data %>%
+          select(RWD, RWS) %>%
+          mutate(speed = RWS) %>%
+          filter(!is.na(speed))
+        
+        # Debugging: Print the structure and content of df
+        print("Filtered Wind Data:")
+        print(df)
+        
+        if (nrow(df) > 0 && any(!is.na(df$RWD))) {
+          df <- df %>%
+            filter(!is.na(RWD)) %>%
+            mutate(angle = RWD)
+          
+          ggplot(df, aes(x = angle, y = speed, fill = speed)) +
+            geom_bar(stat = "identity", width = 10, color = "black") +  # Adjust width to represent direction correctly
+            geom_text(aes(label = speed, y = speed + 0.5), color = "black", size = 3, vjust = 0) +  # Add wind speed labels
+            coord_polar(start = 0) +  # Start at the top (North)
+            scale_x_continuous(limits = c(0, 360), breaks = seq(0, 360, by = 45), 
+                               labels = c("N", "NE", "E", "SE", "S", "SW", "W", "NW", "N")) +  # Ensure N, E, S, W labels
+            scale_fill_gradient(low = "blue", high = "red", name = "Speed (m/s)") +  # Add color gradient for speed
+            labs(x = "Direction", y = NULL) +  # Remove y-axis title
+            theme_minimal() +  # Use a minimal theme for better visibility
+            theme(legend.position = "right",
+                  legend.title = element_text(hjust = 0.5),
+                  plot.title = element_text(hjust = 0.5),  # Center-align the title
+                  plot.subtitle = element_text(hjust = 0.5),  # Center-align the subtitle
+                  axis.title.x = element_text(hjust = 0.5))  # Center-align axis title
+        } else if (nrow(df) > 0) {
+          # Plot only RWS data with a simple bar plot if RWD is missing
+          ggplot(df, aes(x = factor(1), y = speed, fill = speed)) +
+            geom_bar(stat = "identity", width = 0.5, color = "black") +
+            geom_text(aes(label = speed, y = speed + 0.5), color = "black", size = 3, vjust = 0) +
+            scale_fill_gradient(low = "blue", high = "red", name = "Speed (m/s)") +
+            labs(x = "", y = "Speed (m/s)", title = "Wind Speed Data (No Direction)") +
+            theme_minimal() +
+            theme(axis.text.x = element_blank(),
+                  axis.ticks.x = element_blank(),
+                  legend.position = "right",
+                  legend.title = element_text(hjust = 0.5),
+                  plot.title = element_text(hjust = 0.5),  # Center-align the title
+                  plot.subtitle = element_text(hjust = 0.5),  # Center-align the subtitle
+                  axis.title.x = element_text(hjust = 0.5),
+                  axis.title.y = element_text(hjust = 0.5))  # Center-align axis titles
+        } else {
+          ggplot() + 
+            labs(title = "No Wind Data Available") +
+            theme(plot.title = element_text(hjust = 0.5))  # Center-align the title
+        }
+      } else {
+        ggplot() + 
+          labs(title = "No Wind Data Available") +
+          theme(plot.title = element_text(hjust = 0.5))  # Center-align the title
+      }
+    } else {
+      ggplot() + 
+        labs(title = "No Wind Data Available") +
+        theme(plot.title = element_text(hjust = 0.5))  # Center-align the title
+    }
+  })
+  
+  # Render the ggplot2 time series chart
+  output$time_series_chart <- renderPlot({
+    clicked_data <- clicked_location_data()
+    
+    if (!is.null(clicked_data)) {
+      # Assuming that date column is available and data needs to be plotted for the past 7 days
+      end_date <- Sys.Date()
+      start_date <- end_date - 7
+      
+      # Filter data for the past 7 days
+      time_series_data <- clicked_data %>%
+        filter(as.Date(date, format = "%m/%d/%Y") >= start_date & as.Date(date, format = "%m/%d/%Y") <= end_date)
+      
+      if (nrow(time_series_data) > 0) {
+        selected_pollutants <- input$pollutants
+        available_pollutants <- intersect(selected_pollutants, colnames(time_series_data))
+        
+        if (length(available_pollutants) > 0) {
+          filtered_data <- time_series_data %>%
+            select(date, hour, all_of(available_pollutants))
+          
+          # Debugging: Print the structure and content of filtered_data
+          print("Filtered Time Series Data:")
+          print(filtered_data)
+          
+          # Convert long format to wide format for plotting
+          long_data <- filtered_data %>%
+            pivot_longer(cols = -c(date, hour), names_to = "Pollutant", values_to = "Value") %>%
+            mutate(datetime = as.POSIXct(paste(date, hour), format = "%m/%d/%Y %H:%M"))
+          
+          # Debugging: Print the structure and content of long_data
+          print("Long Data for Plotting:")
+          print(long_data)
+          
+          # Plot the time series data using ggplot2
+          ggplot(long_data, aes(x = datetime, y = Value, color = Pollutant)) +
+            geom_line() +
+            geom_point() +
+            labs(title = "Time Series Data for Selected Pollutants",
+                 x = "Date",
+                 y = "Value",
+                 color = "Pollutant") +
+            theme_minimal() +
+            theme(plot.title = element_text(hjust = 0.5))  # Center-align the title
+        } else {
+          ggplot() + 
+            labs(title = "No Time Series Data Available for Selected Pollutants") +
+            theme(plot.title = element_text(hjust = 0.5))  # Center-align the title
+        }
+      } else {
+        ggplot() + 
+          labs(title = "No Time Series Data Available for Selected Pollutants") +
+          theme(plot.title = element_text(hjust = 0.5))  # Center-align the title
+      }
+    } else {
+      ggplot() + 
+        labs(title = "No Time Series Data Available") +
+        theme(plot.title = element_text(hjust = 0.5))  # Center-align the title
+    }
+  })
+}
+
+shinyApp(ui, server)
+
